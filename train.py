@@ -10,6 +10,7 @@ import math
 import json
 from pathlib import Path
 import time
+import sys
 
 import accelerate
 import safetensors.torch as safetorch
@@ -19,8 +20,14 @@ from torch import distributed as dist
 from torch import multiprocessing as mp
 from torch import optim
 from torch.utils import data, flop_counter
+from datasets import Dataset
 from torchvision import datasets, transforms, utils
 from tqdm.auto import tqdm
+import torchio as tio
+import nibabel as nib
+import numpy as np
+import os
+from glob import glob
 
 import k_diffusion as K
 
@@ -112,10 +119,12 @@ def main():
     ema_sched_config = config['ema_sched']
 
     # TODO: allow non-square input sizes
-    assert len(model_config['input_size']) == 2 and model_config['input_size'][0] == model_config['input_size'][1]
+    assert len(model_config['input_size']) == 3 and model_config['input_size'][0] == model_config['input_size'][1]
     size = model_config['input_size']
 
-    accelerator = accelerate.Accelerator(gradient_accumulation_steps=args.grad_accum_steps, mixed_precision=args.mixed_precision)
+    # accelerator = accelerate.Accelerator(gradient_accumulation_steps=args.grad_accum_steps, mixed_precision=args.mixed_precision)
+    # remove mixed_precision since current PC not support bf16
+    accelerator = accelerate.Accelerator(gradient_accumulation_steps=args.grad_accum_steps)
     ensure_distributed()
     device = accelerator.device
     unwrap = accelerator.unwrap_model
@@ -213,6 +222,28 @@ def main():
         train_set = load_dataset(dataset_config['location'])
         train_set.set_transform(partial(K.utils.hf_datasets_augs_helper, transform=tf, image_key=dataset_config['image_key']))
         train_set = train_set['train']
+    elif dataset_config['type'] == 'nifti':
+        input_files = sorted(glob(os.path.join(dataset_config['location'], '*.nii.gz')))
+        images = []
+        for input_file in input_files:
+            image = nib.load(input_file).get_fdata(dtype=np.float32)
+            image = np.expand_dims(image, 0)  
+            image = tio.ScalarImage(tensor=image[...])
+            #resize_transform = tio.Resize((model_config['input_size'], model_config['input_size'], model_config['input_size']))
+            image = image.numpy().squeeze()
+            #print(f"image shape: {image.shape}")
+            images.append(image)
+        images = np.array(images)
+
+        # TEST: dummy label
+        labels = np.zeros(len(images))
+
+        captioned_imgs = {
+            'image': images,
+            'label': labels
+        }
+        train_set = Dataset.from_dict(captioned_imgs)
+
     elif dataset_config['type'] == 'custom':
         location = (Path(args.config).parent / dataset_config['location']).resolve()
         spec = importlib.util.spec_from_file_location('custom_dataset', location)
@@ -223,6 +254,8 @@ def main():
         train_set = get_dataset(custom_dataset_config, transform=tf)
     else:
         raise ValueError('Invalid dataset type')
+    
+    print(f"type: {type(train_set)}, shape: {train_set.shape}, train_set: {train_set}")
 
     if accelerator.is_main_process:
         try:
@@ -238,8 +271,10 @@ def main():
     train_dl = data.DataLoader(train_set, args.batch_size, shuffle=True, drop_last=True,
                                num_workers=args.num_workers, persistent_workers=True, pin_memory=True)
 
+
     inner_model, inner_model_ema, opt, train_dl = accelerator.prepare(inner_model, inner_model_ema, opt, train_dl)
 
+    # START A lot of error message comes from this part
     with torch.no_grad(), K.models.flops.flop_counter() as fc:
         x = torch.zeros([1, model_config['input_channels'], size[0], size[1]], device=device)
         sigma = torch.ones([1], device=device)
@@ -249,7 +284,7 @@ def main():
         inner_model(x, sigma, **extra_args)
         if accelerator.is_main_process:
             print(f"Forward pass GFLOPs: {fc.flops / 1_000_000_000:,.3f}", flush=True)
-
+    # END
     if use_wandb:
         wandb.watch(inner_model)
     if accelerator.num_processes == 1:
@@ -433,6 +468,7 @@ def main():
     try:
         while True:
             for batch in tqdm(train_dl, smoothing=0.1, disable=not accelerator.is_main_process):
+            # for batch in train_dl:
                 if device.type == 'cuda':
                     start_timer = torch.cuda.Event(enable_timing=True)
                     end_timer = torch.cuda.Event(enable_timing=True)
@@ -442,6 +478,8 @@ def main():
                     start_timer = time.time()
 
                 with accelerator.accumulate(model):
+                    print(f"--train_dl : {train_dl}")
+                    print(f"--batch : {batch}")
                     reals, _, aug_cond = batch[image_key]
                     class_cond, extra_args = None, {}
                     if num_classes:
